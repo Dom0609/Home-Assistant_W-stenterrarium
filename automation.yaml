@@ -1,0 +1,79 @@
+- conditions:
+          - condition: trigger
+            id: minute_check
+        sequence:
+          - variables:
+              m: "{{ now().month | int }}"
+              # Zeit-Mapping: Jan bis Dez
+              on_times: ["09:00", "08:30", "08:15", "08:00", "07:45", "07:30", "07:30", "07:30", "08:30", "09:00", "09:00", "09:00"]
+              off_times: ["17:30", "18:00", "18:30", "19:00", "20:00", "20:30", "20:45", "20:45", "20:15", "19:30", "19:00", "18:00"]
+              
+              start_time: "{{ on_times[m-1] }}"
+              end_time: "{{ off_times[m-1] }}"
+              
+              now_ts: "{{ as_timestamp(now()) }}"
+              start_ts: "{{ as_timestamp(today_at(start_time)) }}"
+              end_ts: "{{ as_timestamp(today_at(end_time)) }}"
+
+          - choose:
+              # TAG-MODUS: Innerhalb des Zeitfensters (inkl. Puffer)
+              - conditions:
+                  - condition: template
+                    value_template: "{{ now_ts >= (start_ts - 900) and now_ts < (end_ts + 2000) }}"
+                sequence:
+                  # 1. Grundbeleuchtung (mit 15 Min Vorlauf / 30 Min Nachlauf)
+                  - action: >
+                      {% if now_ts >= (start_ts - 900) and now_ts < (end_ts + 1800) %} switch.turn_on {% else %} switch.turn_off {% endif %}
+                    entity_id: switch.grundbeleuchtung
+
+                  # 2. UV-Spot (Punktgenau an / 15 Min Nachlauf)
+                  - action: >
+                      {% if now_ts >= start_ts and now_ts < (end_ts + 900) %} switch.turn_on {% else %} switch.turn_off {% endif %}
+                    entity_id: switch.uv_spot_waermelampe
+
+                  # 3. HDI-Lampe mit Heißzündschutz (15 Min Sperre)
+                  - if:
+                      - condition: template
+                        value_template: "{{ now_ts >= (start_ts + 900) and now_ts < end_ts }}"
+                      - condition: template
+                        value_template: >
+                          {% set last_off = states('input_datetime.hdi_last_off') %}
+                          {{ last_off in ['unknown', 'unavailable'] or (now_ts - as_timestamp(last_off)) > 900 }}
+                    then:
+                      - action: switch.turn_on
+                        entity_id: switch.hdi_lampe
+                    else:
+                      - if:
+                          - condition: template
+                            value_template: "{{ is_state('switch.hdi_lampe', 'on') and now_ts >= end_ts }}"
+                        then:
+                          - action: switch.turn_off
+                            entity_id: switch.hdi_lampe
+                          - action: input_datetime.set_datetime
+                            target:
+                              entity_id: input_datetime.hdi_last_off
+                            data:
+                              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+              # NACHT-MODUS: Alles aus außerhalb der Zeiten
+              - conditions:
+                  - condition: template
+                    value_template: "{{ now_ts < (start_ts - 900) or now_ts >= (end_ts + 2000) }}"
+                sequence:
+                  - action: switch.turn_off
+                    target:
+                      entity_id:
+                        - switch.hdi_lampe
+                        - switch.uv_spot_waermelampe
+                        - switch.grundbeleuchtung
+
+          # --- ÜBERWACHUNG: Defekt-Check ---
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ is_state('switch.hdi_lampe', 'on') and states('sensor.hdi_lampe_leistung') | float(0) < 5 }}
+            then:
+              - action: notify.persistent_notification
+                data:
+                  title: "Wartung erforderlich"
+                  message: "Die HDI-Lampe sollte an sein, zieht aber keinen Strom!"
